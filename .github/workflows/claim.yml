@@ -1,0 +1,39 @@
+name: USDT Faucet Claim
+
+on:
+  schedule:
+    # Run every hour (most faucets have 1 hour cooldown)
+    - cron: '0 * * * *'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  claim-usdt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl-cffi ddddocr requests
+      
+      - name: Run USDT claimer
+        env:
+          USDT_WALLET: ${{ secrets.USDT_WALLET }}
+        run: python claimer.py
+      
+      - name: Commit claim state
+        run: |
+          git config user.name "usdt-faucet-bot"
+          git config user.email "bot@usdt-faucet.gh"
+          git add claim_state.json 2>/dev/null || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "auto: update claim state $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
