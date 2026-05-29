@@ -133,61 +133,105 @@ class RecaptchaAudioSolver:
         else:
             return self._solve_api(page, site_url, site_key_hint)
 
+    def _get_frame(self, page, selector: str, timeout: int = 8):
+        """Get a frame by iframe selector, returns (frame_obj, element) or (None, None)."""
+        try:
+            el = page.wait_for_selector(selector, timeout=timeout * 1000)
+            if el:
+                frame = el.content_frame()
+                if frame:
+                    return frame, el
+        except:
+            pass
+        return None, None
+
+    def _click_in_frame(self, frame, selector: str, timeout: int = 5) -> bool:
+        """Click an element inside a frame, fallback to JS click."""
+        try:
+            frame.wait_for_selector(selector, timeout=timeout * 1000)
+            frame.click(selector, timeout=timeout * 1000)
+            return True
+        except:
+            try:
+                frame.evaluate(f"document.querySelector('{selector}').click()")
+                return True
+            except:
+                return False
+
     def _solve_whisper(self, page) -> bool:
-        """Solve using audio challenge + Whisper transcription."""
+        """Solve using audio challenge + Whisper transcription.
+        
+        Uses content_frame() for direct iframe access, with JS fallback clicks.
+        """
         if not self._load_whisper():
             return False
 
         try:
-            # Step 1: Wait for reCAPTCHA iframe to exist (check via locator, not frame_locator)
+            # Step 1: Find reCAPTCHA anchor iframe
             log.info("  [Whisper] Looking for reCAPTCHA iframe...")
-            recaptcha_iframe = page.locator('iframe[title="reCAPTCHA"]')
-            try:
-                recaptcha_iframe.wait_for(timeout=8000)
-            except Exception:
+            anchor_frame, _ = self._get_frame(page, 'iframe[title="reCAPTCHA"]', timeout=8)
+            if not anchor_frame:
                 log.warning("  [Whisper] No reCAPTCHA iframe found")
                 return False
             
-            # Step 2: Click the reCAPTCHA checkbox inside the iframe
+            # Step 2: Click the reCAPTCHA checkbox
             log.info("  [Whisper] Clicking reCAPTCHA checkbox...")
-            try:
-                anchor_frame = page.frame_locator('iframe[title="reCAPTCHA"]')
-                anchor_frame.locator(".recaptcha-checkbox-border").click(timeout=5000)
-            except Exception as e:
-                log.warning(f"  [Whisper] Could not click checkbox: {e}")
+            clicked = self._click_in_frame(anchor_frame, ".recaptcha-checkbox-border")
+            if not clicked:
+                log.warning("  [Whisper] Could not click checkbox")
                 return False
+            log.info("  [Whisper] Checkbox clicked!")
             time.sleep(2)
             
             # Step 3: Wait for challenge iframe
             log.info("  [Whisper] Waiting for challenge iframe...")
-            challenge_iframe = page.locator('iframe[title*="challenge"]')
-            try:
-                challenge_iframe.wait_for(timeout=8000)
-            except Exception:
+            challenge_frame, _ = self._get_frame(page, 'iframe[title*="challenge"]', timeout=8)
+            if not challenge_frame:
                 log.warning("  [Whisper] Challenge iframe didn't appear")
                 return False
+            log.info("  [Whisper] Challenge iframe found!")
             
-            challenge_frame = page.frame_locator('iframe[title*="challenge"]')
-            
-            # Step 4: Click audio button
+            # Step 4: Click audio button inside challenge iframe
             log.info("  [Whisper] Clicking audio button...")
-            try:
-                challenge_frame.locator("#recaptcha-audio-button").click(timeout=5000)
-                time.sleep(2)
-            except Exception as e:
-                log.warning(f"  [Whisper] Audio button not found: {e}")
+            clicked = self._click_in_frame(challenge_frame, "#recaptcha-audio-button")
+            if not clicked:
+                log.warning("  [Whisper] Could not click audio button")
+                return False
+            log.info("  [Whisper] Audio button clicked!")
+            
+            # Step 5: Wait for audio source to appear (max 15s)
+            log.info("  [Whisper] Waiting for audio source...")
+            audio_el = None
+            for _ in range(15):
+                try:
+                    audio_el = challenge_frame.wait_for_selector("#audio-source", timeout=1000)
+                    if audio_el:
+                        break
+                except:
+                    pass
+                time.sleep(1)
+            
+            if not audio_el:
+                log.warning("  [Whisper] Audio source element not found in 15s")
+                # Debug: dump iframe HTML to understand what's there
+                try:
+                    body_html = challenge_frame.evaluate("() => document.body.innerHTML.substring(0, 2000)")
+                    log.warning(f"  [Whisper] Challenge iframe HTML: {body_html[:500]}")
+                except:
+                    pass
+                try:
+                    page.screenshot(path=f"debug_audio_fail.png")
+                except:
+                    pass
                 return False
             
-            # Step 5: Get audio source URL
-            log.info("  [Whisper] Getting audio URL...")
-            audio_src = challenge_frame.locator("#audio-source").get_attribute("src")
+            audio_src = audio_el.get_attribute("src")
             if not audio_src:
-                log.warning("  [Whisper] Audio source not found")
+                log.warning("  [Whisper] Audio source has no src attribute")
                 return False
-            
             log.info(f"  [Whisper] Audio URL: {audio_src[:60]}...")
             
-            # Step 4: Download audio
+            # Step 6: Download audio
             import urllib.request
             audio_path = os.path.join(tempfile.gettempdir(), "captcha.mp3")
             urllib.request.urlretrieve(audio_src, audio_path)
@@ -198,7 +242,7 @@ class RecaptchaAudioSolver:
                 log.warning("  [Whisper] Audio too small, may be invalid")
                 return False
             
-            # Step 6: Transcribe with Whisper
+            # Step 7: Transcribe with Whisper
             log.info("  [Whisper] Transcribing with Whisper...")
             segments, info = self.whisper_model.transcribe(
                 audio_path, 
@@ -213,20 +257,20 @@ class RecaptchaAudioSolver:
                 log.warning("  [Whisper] Empty transcription")
                 return False
             
-            # Step 7: Submit answer
+            # Step 8: Submit answer
             log.info(f"  [Whisper] Submitting answer: '{answer}'")
-            response_input = challenge_frame.locator("#audio-response")
-            response_input.fill(answer)
+            response_input = challenge_frame.wait_for_selector("#audio-response", timeout=5000)
+            if response_input:
+                response_input.fill(answer)
             time.sleep(0.5)
             
-            verify_btn = challenge_frame.locator("#recaptcha-verify-button")
-            verify_btn.click(timeout=5000)
+            self._click_in_frame(challenge_frame, "#recaptcha-verify-button", timeout=5)
             time.sleep(2)
             
             log.info("  [Whisper] SOLVED!")
             time.sleep(1)
             
-            # Step 8: Click form submit button (if captcha was the last step)
+            # Step 9: Click form submit button
             for selector in ['#login', '#submit', 'button[type="submit"]', '.btn-claim', '#claim']:
                 try:
                     btn = page.query_selector(selector)
@@ -242,6 +286,8 @@ class RecaptchaAudioSolver:
             
         except Exception as e:
             log.warning(f"  [Whisper] Error: {e}")
+            import traceback
+            log.warning(f"  [Whisper] Traceback: {traceback.format_exc()}")
             return False
 
     def _solve_api(self, page, site_url: str, site_key_hint: str) -> bool:
