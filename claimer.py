@@ -139,40 +139,46 @@ class RecaptchaAudioSolver:
             return False
 
         try:
-            # Step 1: Click the reCAPTCHA checkbox
-            log.info("  [Whisper] Clicking reCAPTCHA checkbox...")
-            anchor_frame = page.frame_locator("iframe[title='reCAPTCHA']")
-            if anchor_frame.count() == 0:
+            # Step 1: Wait for reCAPTCHA iframe to exist (check via locator, not frame_locator)
+            log.info("  [Whisper] Looking for reCAPTCHA iframe...")
+            recaptcha_iframe = page.locator('iframe[title="reCAPTCHA"]')
+            try:
+                recaptcha_iframe.wait_for(timeout=8000)
+            except Exception:
                 log.warning("  [Whisper] No reCAPTCHA iframe found")
                 return False
             
-            anchor_frame.locator(".recaptcha-checkbox-border").click(timeout=5000)
+            # Step 2: Click the reCAPTCHA checkbox inside the iframe
+            log.info("  [Whisper] Clicking reCAPTCHA checkbox...")
+            try:
+                anchor_frame = page.frame_locator('iframe[title="reCAPTCHA"]')
+                anchor_frame.locator(".recaptcha-checkbox-border").click(timeout=5000)
+            except Exception as e:
+                log.warning(f"  [Whisper] Could not click checkbox: {e}")
+                return False
             time.sleep(2)
             
-            # Step 2: Switch to audio challenge
-            log.info("  [Whisper] Switching to audio challenge...")
-            challenge_frame = page.frame_locator("iframe[title*='challenge']")
-            
-            # Wait for challenge iframe to appear
-            for _ in range(10):
-                if challenge_frame.count() > 0:
-                    break
-                time.sleep(1)
-            
-            if challenge_frame.count() == 0:
+            # Step 3: Wait for challenge iframe
+            log.info("  [Whisper] Waiting for challenge iframe...")
+            challenge_iframe = page.locator('iframe[title*="challenge"]')
+            try:
+                challenge_iframe.wait_for(timeout=8000)
+            except Exception:
                 log.warning("  [Whisper] Challenge iframe didn't appear")
                 return False
             
-            # Click the audio button
-            audio_btn = challenge_frame.locator("#recaptcha-audio-button")
-            if audio_btn.count() == 0:
-                log.warning("  [Whisper] Audio button not found")
+            challenge_frame = page.frame_locator('iframe[title*="challenge"]')
+            
+            # Step 4: Click audio button
+            log.info("  [Whisper] Clicking audio button...")
+            try:
+                challenge_frame.locator("#recaptcha-audio-button").click(timeout=5000)
+                time.sleep(2)
+            except Exception as e:
+                log.warning(f"  [Whisper] Audio button not found: {e}")
                 return False
             
-            audio_btn.click(timeout=5000)
-            time.sleep(2)
-            
-            # Step 3: Get audio source URL
+            # Step 5: Get audio source URL
             log.info("  [Whisper] Getting audio URL...")
             audio_src = challenge_frame.locator("#audio-source").get_attribute("src")
             if not audio_src:
@@ -192,7 +198,7 @@ class RecaptchaAudioSolver:
                 log.warning("  [Whisper] Audio too small, may be invalid")
                 return False
             
-            # Step 5: Transcribe with Whisper
+            # Step 6: Transcribe with Whisper
             log.info("  [Whisper] Transcribing with Whisper...")
             segments, info = self.whisper_model.transcribe(
                 audio_path, 
@@ -207,7 +213,7 @@ class RecaptchaAudioSolver:
                 log.warning("  [Whisper] Empty transcription")
                 return False
             
-            # Step 6: Submit answer
+            # Step 7: Submit answer
             log.info(f"  [Whisper] Submitting answer: '{answer}'")
             response_input = challenge_frame.locator("#audio-response")
             response_input.fill(answer)
@@ -218,25 +224,19 @@ class RecaptchaAudioSolver:
             time.sleep(2)
             
             log.info("  [Whisper] SOLVED!")
+            time.sleep(1)
             
-            # Step 7: Check if solved by looking for success indicator
-            try:
-                # After solving, the submit button should be enabled
-                submit_btn = page.query_selector('#login')
-                if submit_btn:
-                    submit_btn.click(timeout=3000)
-                    time.sleep(3)
-            except:
-                pass
-            
-            # Try to click the verify/submit button on parent page
-            try:
-                submit_btn = page.query_selector('#login')
-                if submit_btn and submit_btn.is_visible():
-                    submit_btn.click()
-                    time.sleep(3)
-            except:
-                pass
+            # Step 8: Click form submit button (if captcha was the last step)
+            for selector in ['#login', '#submit', 'button[type="submit"]', '.btn-claim', '#claim']:
+                try:
+                    btn = page.query_selector(selector)
+                    if btn and btn.is_visible():
+                        log.info(f"  [Whisper] Clicking '{selector}'...")
+                        btn.click(timeout=3000)
+                        time.sleep(3)
+                        break
+                except:
+                    continue
             
             return True
             
@@ -455,7 +455,7 @@ class FaucetClaimer:
 # ===== MAIN =====
 def main():
     log.info("=" * 65)
-    log.info("  FAUCET AUTOMATION v3 (Whisper Audio Solver)")
+    log.info("  FAUCET AUTOMATION v4 (Whisper Audio Solver)")
     log.info(f"  FaucetPay: {FAUCETPAY_EMAIL}")
     log.info(f"  Captcha: WHISPER (FREE, no API key)")
     log.info(f"  Time: {datetime.now(timezone.utc).isoformat()}")
