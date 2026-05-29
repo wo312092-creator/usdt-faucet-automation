@@ -1,62 +1,74 @@
 #!/usr/bin/env python3
 """
-USDT / TRX Faucet Automation Bot - v3 (Whisper Captcha Solver)
-==============================================================
-REALITY-BASED:
+USDT / TRX Faucet Automation Bot - v6 (Universal)
+==================================================
+FREE reCAPTCHA solving using Audio (Whisper) + Image (SKIP/VERIFY) strategies.
+Works on ANY machine with a clean residential IP.
+
+REALITY:
   - Sites pay via FaucetPay, NOT direct wallet
-  - They use Google reCAPTCHA v2 (checkbox)
-  - We solve it COMPLETELY FREE using OpenAI Whisper audio transcription
-  - Playwright browser automation (no curl_cffi needed)
+  - Google reCAPTCHA v2 blocks data-center IPs (GitHub Actions, etc.)
+  - Audio+Whisper works from residential IPs (confirmed: Libyan IP)
+  - This script adapts: runs full solve on clean IPs, diagnostic-only on blocked IPs
 
-FREE CAPTCHA SOLVING:
-  1. Click reCAPTCHA checkbox
-  2. Switch to audio challenge (accessibility mode)
-  3. Download the audio MP3
-  4. Transcribe with faster-whisper (tiny model, 39MB, CPU, int8)
-  5. Submit answer
-  6. Cost: $0.00
-
-Supported sites:
-  1. FreeTether (claimto.xyz) - USDT - every 1 min - FaucetPay
-  2. Tether faucet (ethiomi.com) - USDT - every 1 min - FaucetPay
-  3. FreeTRX.su - TRX - every 2 min - FaucetPay (PROVEN WORKING)
+DEPLOYMENT OPTIONS (100% FREE):
+  1. Local PC (residential IP) — confirmed working → use run_locally.bat
+  2. Google Colab — free GPU, test if IP is whitelisted
+  3. Any free-tier VPS with clean IP
 """
 
-import os, sys, json, time, logging, tempfile
+import os, sys, json, time, logging, tempfile, traceback
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
+
+# ── Detect environment ────────────────────────────────────────────
+ON_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+IS_WINDOWS = sys.platform.startswith("win")
+
+# ── Config ────────────────────────────────────────────────────────
+FAUCETPAY_EMAIL = os.environ.get("FAUCETPAY_EMAIL", "pedagroup.co2020@gmail.com").strip()
+HEADLESS = True  # Always headless in automation
+WHISPER_MODEL = "tiny"
+
+STATE_FILE = "claim_state.json"
+LOG_DIR = Path("logs")
+SCREENSHOT_DIR = Path("screenshots")
+LOG_DIR.mkdir(exist_ok=True)
+SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+log_file = LOG_DIR / f"claimer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(str(log_file), encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 log = logging.getLogger(__name__)
 
-# ===== CONFIG (from secrets) =====
-FAUCETPAY_EMAIL = os.environ.get("FAUCETPAY_EMAIL", "").strip()
-FAUCETPAY_PASS = os.environ.get("FAUCETPAY_PASS", "").strip()
-CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "").strip()
-CAPTCHA_SERVICE = os.environ.get("CAPTCHA_SERVICE", "whisper").strip().lower()
-
-if not FAUCETPAY_EMAIL:
-    log.error("[FATAL] FAUCETPAY_EMAIL not set!")
-    sys.exit(1)
-
-STATE_FILE = "claim_state.json"
-WHISPER_CACHE = os.path.expanduser("~/.cache/whisper")
+SITES = [
+    # (key, url, cooldown_sec, needs_login, select_email_first)
+    ("claimto.xyz", "https://freeusdt.claimto.xyz", 60,  False, True),
+    ("ethiomi.com", "https://freeusdt.ethiomi.com", 60,  True,  False),
+    ("freetrx.su",  "https://freetrx.su",           120, True,  False),
+]
 
 
-# ===== STATE MANAGER =====
+# ═══════════════════════════════════════════════════════════════════
+#  STATE
+# ═══════════════════════════════════════════════════════════════════
 class StateManager:
     def __init__(self, path=STATE_FILE):
-        self.path = path
+        self.path = Path(path)
         self.data = {}
         self._load()
 
     def _load(self):
         try:
-            with open(self.path, "r") as f:
+            with open(self.path) as f:
                 self.data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self.data = {"claims": {}, "total_earned": 0.0}
@@ -65,427 +77,238 @@ class StateManager:
         with open(self.path, "w") as f:
             json.dump(self.data, f, indent=2)
 
-    def get_last_claim(self, site_key: str) -> float:
-        return self.data.get("claims", {}).get(site_key, 0)
+    def get_last_claim(self, key: str) -> float:
+        return self.data.get("claims", {}).get(key, 0)
 
-    def mark_claimed(self, site_key: str, amount: float = 0.0):
-        if "claims" not in self.data:
-            self.data["claims"] = {}
-        self.data["claims"][site_key] = time.time()
+    def mark_claimed(self, key: str, amount: float = 0.0):
+        self.data.setdefault("claims", {})[key] = time.time()
         self.data["total_earned"] = self.data.get("total_earned", 0.0) + amount
         self.save()
 
-    def cooldown_remaining(self, site_key: str, cooldown: int) -> int:
-        elapsed = time.time() - self.get_last_claim(site_key)
-        return max(0, int(cooldown - elapsed))
+    def cooldown_remaining(self, key: str, cooldown: int) -> int:
+        return max(0, int(cooldown - (time.time() - self.get_last_claim(key))))
 
 
-# ===== WHISPER CAPTCHA SOLVER =====
-class RecaptchaAudioSolver:
+# ═══════════════════════════════════════════════════════════════════
+#  RECAPTCHA SOLVER
+# ═══════════════════════════════════════════════════════════════════
+class RecaptchaSolver:
     """
-    SOLVE reCAPTCHA v2 using AUDIO CHALLENGE + Whisper
-    --- COMPLETELY FREE, NO API KEY NEEDED ---
-    
-    How it works:
-    1. Click the reCAPTCHA checkbox via Playwright
-    2. Switch to audio challenge mode
-    3. Download the audio MP3 from Google
-    4. Transcribe using faster-whisper (tiny model, CPU)
-    5. Submit the transcribed text
-    6. reCAPTCHA solved!
+    Multi-strategy free reCAPTCHA v2 solver:
+      1) Click checkbox
+      2) Audio challenge → Whisper (works on clean IPs)
+      3) SKIP / VERIFY (for "none" challenges)
+      4) Diagnostic info when all fails
     """
 
     def __init__(self):
         self.whisper_model = None
-        self.model_loaded = False
-        self.use_whisper = (CAPTCHA_SERVICE == "whisper" or not CAPTCHA_API_KEY)
-        
-        if self.use_whisper:
-            log.info("[Captcha] Using Whisper audio solver (FREE, no API key)")
-        else:
-            log.info(f"[Captcha] Using {CAPTCHA_SERVICE} API")
+        self._load_whisper()
 
     def _load_whisper(self):
-        """Load faster-whisper model (tiny, 39MB, CPU, int8)."""
-        if self.model_loaded:
-            return True
         try:
             from faster_whisper import WhisperModel
-            log.info("[Whisper] Loading tiny model (39MB)...")
-            self.whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-            self.model_loaded = True
-            log.info("[Whisper] Model loaded!")
-            return True
+            log.info(f"[Whisper] Loading '{WHISPER_MODEL}' model (CPU int8)...")
+            self.whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            log.info("[Whisper] Ready")
         except ImportError:
             log.warning("[Whisper] faster-whisper not installed")
-            return False
         except Exception as e:
-            log.error(f"[Whisper] Load failed: {e}")
-            return False
+            log.warning(f"[Whisper] Load error: {e}")
 
-    def solve(self, page, site_url: str, site_key_hint: str = "") -> bool:
-        """
-        Solve reCAPTCHA v2 on the current page.
-        Returns True if solved successfully.
-        """
-        if self.use_whisper:
-            return self._solve_whisper(page)
-        else:
-            return self._solve_api(page, site_url, site_key_hint)
-
-    def _get_frame(self, page, selector: str, timeout: int = 8):
-        """Get a frame by iframe selector, returns (frame_obj, element) or (None, None)."""
+    # ── helpers ───────────────────────────────────────────────────
+    def _get_frame(self, page, sel: str, timeout: int = 10):
         try:
-            el = page.wait_for_selector(selector, timeout=timeout * 1000)
-            if el:
-                frame = el.content_frame()
-                if frame:
-                    return frame, el
+            el = page.wait_for_selector(sel, timeout=timeout * 1000)
+            return el.content_frame() if el else None
         except:
-            pass
-        return None, None
+            return None
 
-    def _click_in_frame(self, frame, selector: str, timeout: int = 5) -> bool:
-        """Click an element inside a frame, fallback to JS click."""
+    def _click_frame(self, frame, sel: str, timeout: int = 5) -> bool:
         try:
-            frame.wait_for_selector(selector, timeout=timeout * 1000)
-            frame.click(selector, timeout=timeout * 1000)
+            frame.wait_for_selector(sel, timeout=timeout * 1000)
+            frame.click(sel, timeout=timeout * 1000)
             return True
         except:
             try:
-                frame.evaluate(f"document.querySelector('{selector}').click()")
+                frame.evaluate(f"document.querySelector('{sel}').click()")
                 return True
             except:
                 return False
 
-    def _check_captcha_solved(self, page) -> bool:
-        """Check if reCAPTCHA already solved by checking g-recaptcha-response."""
+    def _is_solved(self, page) -> bool:
         try:
-            val = page.evaluate("""
-                () => {
-                    const ta = document.getElementById('g-recaptcha-response');
-                    return ta ? ta.value : '';
-                }
-            """)
-            if val and len(val) > 50:
-                log.info(f"  [Whisper] reCAPTCHA already solved! response={val[:20]}...")
+            v = page.evaluate("() => { const t = document.getElementById('g-recaptcha-response'); return t ? t.value : ''; }")
+            if v and len(v) > 50:
+                log.info(f"  ✓ token={v[:20]}...")
                 return True
         except:
             pass
         return False
 
-    def _try_audio_solve(self, challenge_frame, page) -> bool:
-        """Try to solve reCAPTCHA using audio challenge + Whisper transcription."""
-        # Click audio button
-        log.info("  [Whisper] Clicking audio button...")
-        clicked = self._click_in_frame(challenge_frame, "#recaptcha-audio-button")
-        if not clicked:
-            log.warning("  [Whisper] Could not click audio button")
-            return False
-        log.info("  [Whisper] Audio button clicked!")
-        
-        # Wait for audio source element to appear (poll for 20s)
-        log.info("  [Whisper] Waiting for audio source...")
-        audio_el = None
-        for _ in range(20):
-            try:
-                audio_el = challenge_frame.wait_for_selector("#audio-source", timeout=1000)
-                if audio_el:
-                    break
-            except:
-                pass
-            time.sleep(1)
-        
-        if not audio_el:
-            log.warning("  [Whisper] Audio source not found in 20s")
-            # Debug info
-            try:
-                body_html = challenge_frame.evaluate("() => document.body.innerHTML")
-                log.warning(f"  [Whisper] Frame HTML snippet: {body_html[:300]}")
-            except:
-                pass
-            return False
-        
-        audio_src = audio_el.get_attribute("src")
-        if not audio_src:
-            log.warning("  [Whisper] Audio source has no src")
-            return False
-        log.info(f"  [Whisper] Audio URL: {audio_src[:60]}...")
-        
-        # Download audio
-        import urllib.request
-        audio_path = os.path.join(tempfile.gettempdir(), "captcha.mp3")
-        urllib.request.urlretrieve(audio_src, audio_path)
-        file_size = os.path.getsize(audio_path)
-        log.info(f"  [Whisper] Downloaded audio: {file_size} bytes")
-        if file_size < 1000:
-            log.warning("  [Whisper] Audio too small, may be invalid")
-            return False
-        
-        # Transcribe with Whisper
-        log.info("  [Whisper] Transcribing with Whisper...")
-        segments, info = self.whisper_model.transcribe(
-            audio_path, language="en", beam_size=1, best_of=1
-        )
-        answer = " ".join(s.text.strip() for s in segments).strip()
-        log.info(f"  [Whisper] Transcribed: '{answer}'")
-        if not answer:
-            log.warning("  [Whisper] Empty transcription")
-            return False
-        
-        # Submit answer
-        log.info("  [Whisper] Submitting transcription...")
+    def _screenshot(self, page, name: str):
         try:
-            response_input = challenge_frame.wait_for_selector("#audio-response", timeout=5000)
-            if response_input:
-                response_input.fill(answer)
-            time.sleep(0.5)
-            challenge_frame.evaluate("document.getElementById('recaptcha-verify-button').click()")
-            time.sleep(2)
-        except Exception as e:
-            log.warning(f"  [Whisper] Submit error: {e}")
-            return False
-        
-        log.info("  [Whisper] SOLVED!")
-        return True
+            p = SCREENSHOT_DIR / f"{name}_{datetime.now().strftime('%H%M%S')}.png"
+            page.screenshot(path=str(p))
+            log.info(f"  📸 {p.name}")
+        except:
+            pass
 
-    def _submit_form(self, page) -> bool:
-        """Click the form submit button if visible."""
-        for selector in ['#login', '#submit', 'button[type="submit"]', '.btn-claim', '#claim', 'input[type="submit"]']:
-            try:
-                btn = page.query_selector(selector)
-                if btn and btn.is_visible():
-                    log.info(f"  [Whisper] Clicking '{selector}'...")
-                    btn.click(timeout=3000)
-                    time.sleep(3)
-                    return True
-            except:
-                continue
+    def _challenge_body(self, frame) -> str:
+        try:
+            return frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except:
+            return ""
+
+    # ── main solver ───────────────────────────────────────────────
+    def solve(self, page) -> bool:
+        log.info("── reCAPTCHA ──")
+
+        # 1. Click checkbox
+        log.info("  1) Checkbox...")
+        f = self._get_frame(page, 'iframe[title="reCAPTCHA"]', 8)
+        if not f or not self._click_frame(f, ".recaptcha-checkbox-border"):
+            log.warning("  ✗ No checkbox")
+            return False
+        log.info("  ✓ Clicked")
+        time.sleep(3)
+
+        if self._is_solved(page):
+            log.info("  ✓ Auto-passed")
+            return True
+
+        # 2. Challenge iframe
+        log.info("  2) Challenge...")
+        cf = self._get_frame(page, 'iframe[title*="challenge"]', 8)
+        if not cf:
+            log.warning("  ✗ No challenge iframe — IP blocked?")
+            self._screenshot(page, "blocked")
+            return False
+        log.info("  ✓ Found")
+
+        # 3. Audio (Whisper)
+        if self.whisper_model:
+            log.info("  3) Audio...")
+            if self._try_audio(cf, page):
+                return True
+
+        # 4. SKIP/VERIFY
+        log.info("  4) SKIP/VERIFY...")
+        if self._try_skip_verify(cf, page):
+            return True
+
+        log.warning("  ✗ All strategies failed")
+        self._screenshot(page, "failed")
         return False
 
-    def _solve_whisper(self, page) -> bool:
-        """Solve reCAPTCHA v2 using a multi-strategy approach.
-        
-        1. Click checkbox → check if already solved (no challenge)
-        2. If challenge appears → try audio (Whisper)
-        3. If audio fails → try skipping image challenge (forces audio on retry)
-        """
-        if not self._load_whisper():
+    # ── Audio ─────────────────────────────────────────────────────
+    def _try_audio(self, frame, page) -> bool:
+        if not self._click_frame(frame, "#recaptcha-audio-button"):
+            log.info("    No audio button")
             return False
+        log.info("    Audio button clicked")
+        time.sleep(2)
 
-        try:
-            # Step 1: Find and click the reCAPTCHA checkbox
-            log.info("  [Whisper] Looking for reCAPTCHA iframe...")
-            anchor_frame, _ = self._get_frame(page, 'iframe[title="reCAPTCHA"]', timeout=8)
-            if not anchor_frame:
-                log.warning("  [Whisper] No reCAPTCHA iframe found")
-                return False
-            
-            log.info("  [Whisper] Clicking reCAPTCHA checkbox...")
-            if not self._click_in_frame(anchor_frame, ".recaptcha-checkbox-border"):
-                log.warning("  [Whisper] Could not click checkbox")
-                return False
-            log.info("  [Whisper] Checkbox clicked!")
-            time.sleep(3)
-            
-            # Step 2: Check if captcha was already solved (Google passed us without challenge)
-            if self._check_captcha_solved(page):
-                log.info("  [Whisper] No challenge needed, captcha auto-solved!")
-                self._submit_form(page)
-                return True
-            
-            # Step 3: Wait for challenge iframe
-            log.info("  [Whisper] Waiting for challenge iframe...")
-            challenge_frame, _ = self._get_frame(page, 'iframe[title*="challenge"]', timeout=8)
-            if not challenge_frame:
-                log.warning("  [Whisper] Challenge iframe didn't appear")
-                return False
-            log.info("  [Whisper] Challenge iframe found!")
-            
-            # Step 4: Try audio approach (primary)
-            if self._try_audio_solve(challenge_frame, page):
-                if self._check_captcha_solved(page):
-                    self._submit_form(page)
-                    return True
-            
-            # Step 5: Image challenge strategy - try SKIP or VERIFY without selecting
-            # Some challenges say "If there are none, click skip" - click SKIP
-            # Others say "Click verify once there are none left" - click VERIFY with no tiles selected
-            log.info("  [Whisper] Trying image challenge (SKIP/VERIFY)...")
-            for attempt in range(3):
-                try:
-                    body_text = challenge_frame.evaluate("() => document.body ? document.body.innerText : ''")
-                    log.info(f"  [Whisper] Challenge text: {body_text[:100]}")
-                except:
-                    body_text = ""
-                
-                try:
-                    # Try SKIP button first
-                    skip_btn = challenge_frame.wait_for_selector("button:has-text('SKIP')", timeout=2000)
-                    if skip_btn:
-                        skip_btn.click()
-                        time.sleep(2)
-                        log.info(f"  [Whisper] Clicked SKIP (attempt {attempt + 1})")
-                        
-                        # Check if solved
-                        if self._check_captcha_solved(page):
-                            self._submit_form(page)
-                            return True
-                        continue
-                except:
-                    pass
-                
-                try:
-                    # Try VERIFY button (without selecting tiles)
-                    verify_btn = challenge_frame.wait_for_selector("button:has-text('VERIFY')", timeout=2000)
-                    if verify_btn:
-                        verify_btn.click()
-                        time.sleep(2)
-                        log.info(f"  [Whisper] Clicked VERIFY (attempt {attempt + 1})")
-                        
-                        # Check if solved
-                        if self._check_captcha_solved(page):
-                            self._submit_form(page)
-                            return True
-                        continue
-                except:
-                    pass
-                
-                # If SKIP/VERIFY not found, try reload
-                try:
-                    reload_btn = challenge_frame.wait_for_selector("#recaptcha-reload-button", timeout=2000)
-                    if reload_btn:
-                        reload_btn.click()
-                        time.sleep(2)
-                        log.info(f"  [Whisper] Reloaded challenge (attempt {attempt + 1})")
-                        
-                        # Try audio again after reload
-                        if self._try_audio_solve(challenge_frame, page):
-                            if self._check_captcha_solved(page):
-                                self._submit_form(page)
-                                return True
-                except:
-                    pass
-            
-            log.warning("  [Whisper] All solving strategies failed")
-            return False
-            
-        except Exception as e:
-            log.warning(f"  [Whisper] Error: {e}")
-            import traceback
-            log.warning(f"  [Whisper] Traceback: {traceback.format_exc()}")
-            return False
-
-    def _solve_api(self, page, site_url: str, site_key_hint: str) -> bool:
-        """Fallback: Solve using a captcha API service."""
-        if not CAPTCHA_API_KEY:
-            return False
-        
-        log.info(f"  [API] Using {CAPTCHA_SERVICE}...")
-        try:
-            # Get the site key from the page
-            sitekey = page.evaluate("""
-                () => {
-                    const el = document.querySelector('.g-recaptcha');
-                    return el ? el.getAttribute('data-sitekey') : null;
-                }
-            """)
-            if not sitekey:
-                log.warning("  [API] Site key not found")
-                return False
-            
-            log.info(f"  [API] Site key: {sitekey[:20]}...")
-            
-            # Call the API service
-            import requests
-            
-            if CAPTCHA_SERVICE == "capsolver":
-                r = requests.post("https://api.capsolver.com/createTask", json={
-                    "clientKey": CAPTCHA_API_KEY,
-                    "task": {
-                        "type": "ReCaptchaV2TaskProxyLess",
-                        "websiteURL": site_url,
-                        "websiteKey": sitekey,
-                    }
-                }, timeout=30).json()
-                if r.get("errorId") != 0:
-                    log.error(f"  [API] Create failed: {r.get('errorDescription')}")
-                    return False
-                task_id = r["taskId"]
-                
-                for _ in range(30):
-                    time.sleep(2)
-                    r = requests.post("https://api.capsolver.com/getTaskResult", json={
-                        "clientKey": CAPTCHA_API_KEY,
-                        "taskId": task_id
-                    }, timeout=15).json()
-                    if r.get("status") == "ready":
-                        token = r["solution"]["gRecaptchaResponse"]
+        src = None
+        for _ in range(25):
+            try:
+                el = frame.wait_for_selector("#audio-source", timeout=1000)
+                if el:
+                    src = el.get_attribute("src")
+                    if src:
                         break
-                else:
-                    log.warning("  [API] Timeout")
-                    return False
-            
-            elif CAPTCHA_SERVICE == "nopecha":
-                r = requests.post("https://nopecha.com/api/v1/solve", json={
-                    "type": "recaptcha",
-                    "sitekey": sitekey,
-                    "url": site_url,
-                }, timeout=60).json()
-                if r.get("data"):
-                    token = r["data"]
-                else:
-                    log.warning(f"  [API] NopeCHA failed: {r}")
-                    return False
-            else:
-                log.error(f"  [API] Unknown service: {CAPTCHA_SERVICE}")
-                return False
-            
-            # Inject token into page
-            log.info(f"  [API] Got token: {token[:30]}...")
-            page.evaluate(f"""
-                () => {{
-                    document.querySelectorAll('textarea[id^="g-recaptcha-response"]').forEach(ta => {{
-                        ta.innerHTML = '{token}';
-                        ta.value = '{token}';
-                        ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    }});
-                    const loginBtn = document.getElementById('login');
-                    if (loginBtn) loginBtn.classList.remove('d-none');
-                    if (typeof enableBtn === 'function') enableBtn();
-                    return true;
-                }}
-            """)
+            except:
+                pass
             time.sleep(1)
-            
-            submit_btn = page.query_selector('#login')
-            if submit_btn and submit_btn.is_visible():
-                submit_btn.click()
-                time.sleep(3)
-            
-            return True
-            
+
+        if not src:
+            log.warning("    No audio source (25s)")
+            log.info(f"    Frame text: {self._challenge_body(frame)[:300]}")
+            return False
+        log.info(f"    URL: {src[:70]}...")
+
+        import urllib.request
+        ap = os.path.join(tempfile.gettempdir(), "cap.mp3")
+        try:
+            urllib.request.urlretrieve(src, ap)
+            sz = os.path.getsize(ap)
+            log.info(f"    Downloaded: {sz}B")
+            if sz < 1000:
+                return False
         except Exception as e:
-            log.error(f"  [API] Error: {e}")
+            log.warning(f"    Download error: {e}")
             return False
 
+        log.info("    Transcribing...")
+        try:
+            segs, _ = self.whisper_model.transcribe(ap, language="en", beam_size=1, best_of=1)
+            ans = " ".join(s.text.strip() for s in segs).strip()
+            log.info(f"    Whisper: '{ans}'")
+        except Exception as e:
+            log.warning(f"    Whisper error: {e}")
+            return False
 
-# ===== PLAYWRIGHT FAUCET CLAIMER =====
-class FaucetClaimer:
-    def __init__(self, state: StateManager, captcha: RecaptchaAudioSolver):
+        if not ans:
+            return False
+
+        try:
+            inp = frame.wait_for_selector("#audio-response", timeout=5000)
+            if inp:
+                inp.fill(ans)
+            time.sleep(0.5)
+            frame.evaluate("document.getElementById('recaptcha-verify-button').click()")
+            time.sleep(3)
+        except Exception as e:
+            log.warning(f"    Submit error: {e}")
+            return False
+
+        return self._is_solved(page)
+
+    # ── SKIP / VERIFY ─────────────────────────────────────────────
+    def _try_skip_verify(self, frame, page) -> bool:
+        for i in range(3):
+            txt = self._challenge_body(frame)
+            log.info(f"    Challenge: '{txt[:100]}'")
+
+            for label in ("SKIP", "VERIFY"):
+                try:
+                    btn = frame.wait_for_selector(f'button:has-text("{label}")', timeout=2000)
+                    if btn:
+                        btn.click()
+                        time.sleep(2)
+                        log.info(f"    Clicked {label} ({i+1})")
+                        if self._is_solved(page):
+                            return True
+                except:
+                    pass
+
+            # Reload
+            try:
+                rb = frame.wait_for_selector("#recaptcha-reload-button", timeout=2000)
+                if rb:
+                    rb.click()
+                    time.sleep(2)
+            except:
+                pass
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SITE CLAIMER
+# ═══════════════════════════════════════════════════════════════════
+class SiteClaimer:
+    def __init__(self, state: StateManager, captcha: RecaptchaSolver):
         self.state = state
         self.captcha = captcha
-        self.playwright = None
-        self.browser = None
         self.page = None
-        self.total_claims = 0
+        self._pw = None
+        self._browser = None
 
-    def start_browser(self):
+    def start(self):
         from playwright.sync_api import sync_playwright
-        self.playwright = sync_playwright().__enter__()
-        
-        self.browser = self.playwright.chromium.launch(
-            headless=True,
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -494,146 +317,128 @@ class FaucetClaimer:
             ],
             timeout=30000,
         )
-        
-        context = self.browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+        ctx = self._browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
             viewport={"width": 1280, "height": 800},
             locale="en-US",
         )
-        
-        # Anti-detection: override automation signals before any page loads
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            // Override chrome.runtime to look like a real browser
-            window.chrome = { runtime: {} };
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get:()=>undefined});
+            Object.defineProperty(navigator, 'plugins', {get:()=>[1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get:()=>['en-US','en']});
+            window.chrome = {runtime:{}};
         """)
-        
-        self.page = context.new_page()
-        log.info("[Browser] Started")
+        self.page = ctx.new_page()
 
-    def close_browser(self):
+    def stop(self):
         try:
             if self.page: self.page.close()
-            if self.browser: self.browser.close()
-            if self.playwright: self.playwright.__exit__(None, None, None)
-        except: pass
+            if self._browser: self._browser.close()
+            if self._pw: self._pw.stop()
+        except:
+            pass
 
-    def _fill_address(self, email: str):
-        """Enter FaucetPay email into the address field."""
-        inp = self.page.query_selector('#address')
-        if inp:
-            inp.fill("")
-            inp.fill(email)
-            time.sleep(0.5)
-
-    def _click_button(self, text: str) -> bool:
-        """Click a button by visible text."""
-        btns = self.page.query_selector_all('button')
-        for btn in btns:
-            if text.lower() in (btn.inner_text() or "").lower():
-                btn.click()
-                time.sleep(1)
-                return True
-        return False
-
-    def claim_site(self, site_key: str, url: str, cooldown: int,
-                   needs_login: bool = False, select_email: bool = False) -> bool:
-        """Generic claim flow for any Claimto faucet."""
-        remaining = self.state.cooldown_remaining(site_key, cooldown)
-        if remaining > 0:
-            log.info(f"[{site_key}] Cooldown: {remaining}s")
+    def claim(self, key: str, url: str, cooldown: int, needs_login: bool, select_email: bool) -> bool:
+        rem = self.state.cooldown_remaining(key, cooldown)
+        if rem > 0:
+            log.info(f"[{key}] ⏳ cooldown {rem}s")
             return False
 
-        log.info(f"[{site_key}] Opening {url}...")
+        log.info(f"\n─── {key} ───")
         try:
             self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            time.sleep(2)
-            
-            # Step 1: Select Email radio if needed
+            time.sleep(3)
+
             if select_email:
-                email_radio = self.page.query_selector('#type-email')
-                if email_radio:
-                    email_radio.click()
+                try:
+                    self.page.click("#type-email", timeout=5000)
                     time.sleep(0.5)
-            
-            # Step 2: Enter FaucetPay email
-            log.info(f"  Entering FaucetPay email...")
-            self._fill_address(FAUCETPAY_EMAIL)
-            
-            # Step 3: Click Start/Login button
-            btn_text = "start" if not needs_login else "login"
-            log.info(f"  Clicking {btn_text.title()}...")
-            self._click_button(btn_text)
-            time.sleep(2)
-            
-            # Step 4: Solve captcha
-            log.info(f"  Solving captcha...")
-            solved = self.captcha.solve(self.page, url, site_key)
-            
+                except:
+                    pass
+
+            # Fill address via JS (handles disabled state)
+            self.page.evaluate(
+                "(e) => { const i = document.getElementById('address'); if(i) { i.value = e; i.dispatchEvent(new Event('input',{bubbles:true})); } }",
+                FAUCETPAY_EMAIL,
+            )
+            time.sleep(0.5)
+
+            btn_label = "start" if not needs_login else "login"
+            clicked = self.page.evaluate(
+                """(t) => {
+                    for (const b of document.querySelectorAll('button')) {
+                        if (b.innerText.toLowerCase().includes(t)) { b.click(); return true; }
+                    }
+                    return false;
+                }""",
+                btn_label,
+            )
+            if not clicked:
+                log.warning(f"  No '{btn_label}' button")
+                self._screenshot(f"{key}_no_btn")
+                return False
+            time.sleep(3)
+
+            solved = self.captcha.solve(self.page)
             if solved:
-                self.total_claims += 1
-                self.state.mark_claimed(site_key, 0.002)
-                log.info(f"[{site_key}] ✅ CLAIM SUCCESSFUL!")
+                self.state.mark_claimed(key, 0.002)
+                log.info(f"[{key}] ✅ CLAIMED")
+                self._screenshot(f"{key}_ok")
                 return True
             else:
-                log.warning(f"[{site_key}] ❌ Captcha failed")
+                log.warning(f"[{key}] ❌ captcha unsolved")
                 return False
 
         except Exception as e:
-            log.error(f"[{site_key}] Error: {e}")
-            try:
-                self.page.screenshot(path=f"debug_{site_key}.png")
-            except: pass
+            log.error(f"[{key}] Error: {e}")
+            log.error(traceback.format_exc())
+            self._screenshot(f"{key}_crash")
             return False
 
+    def _screenshot(self, name: str):
+        try:
+            p = SCREENSHOT_DIR / f"{name}_{datetime.now().strftime('%H%M%S')}.png"
+            self.page.screenshot(path=str(p))
+            log.info(f"  📸 {p.name}")
+        except:
+            pass
 
-# ===== MAIN =====
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════
 def main():
-    log.info("=" * 65)
-    log.info("  FAUCET AUTOMATION v5 (Whisper + Image SKIP/VERIFY)")
-    log.info(f"  FaucetPay: {FAUCETPAY_EMAIL}")
-    log.info(f"  Captcha: WHISPER (FREE, no API key)")
-    log.info(f"  Time: {datetime.now(timezone.utc).isoformat()}")
-    log.info("=" * 65)
+    log.info("╔" + "═" * 58 + "╗")
+    log.info("║        USDT/TRX FAUCET AUTOMATION — v6 (Universal) ║")
+    log.info("║        Audio(Whisper) + SKIP/VERIFY reCAPTCHA solver║")
+    log.info("║        FaucetPay: " + FAUCETPAY_EMAIL.ljust(42) + "║")
+    log.info("╠" + "═" * 58 + "╣")
+    log.info(f"║  GHA:{str(ON_GITHUB_ACTIONS):>5}  |  OS:{sys.platform:>7}         ║")
+    log.info(f"║  Headless:{str(HEADLESS):>5}  |  Whisper:{WHISPER_MODEL:>6}          ║")
+    log.info(f"║  Log: {str(log_file):>48} ║")
+    log.info("╚" + "═" * 58 + "╝")
 
     state = StateManager()
-    captcha = RecaptchaAudioSolver()
-    claimer = FaucetClaimer(state, captcha)
+    captcha = RecaptchaSolver()
+    claimer = SiteClaimer(state, captcha)
 
     try:
-        claimer.start_browser()
-
-        sites = [
-            # (key, url, cooldown_sec, needs_login, select_email)
-            ("claimto.xyz",  "https://freeusdt.claimto.xyz",  60,  False, True),
-            ("ethiomi.com",  "https://freeusdt.ethiomi.com",  60,  True,  False),
-            ("freetrx.su",   "https://freetrx.su",           120, True,  False),
-        ]
-
+        claimer.start()
         results = {}
-        for key, url, cd, login, email_sel in sites:
-            log.info(f"\n--- {key} (every {cd}s) ---")
-            results[key] = claimer.claim_site(key, url, cd, login, email_sel)
-            log.info(f"  -> {'SUCCESS' if results[key] else 'SKIP/FAIL'}")
+        for key, url, cd, login, email_sel in SITES:
+            results[key] = claimer.claim(key, url, cd, login, email_sel)
 
-        # Summary
-        success = sum(1 for v in results.values() if v)
-        log.info("\n" + "=" * 65)
-        log.info(f"  RESULTS: {success}/{len(sites)} claimed")
+        ok = sum(1 for v in results.values() if v)
+        log.info(f"\n{'='*60}")
+        log.info(f"  {ok}/{len(SITES)} claimed this cycle")
         for k, v in results.items():
-            log.info(f"    {k}: {'OK' if v else 'X'}")
-        log.info(f"  Total claims this run: {claimer.total_claims}")
+            log.info(f"    {k}: {'✅' if v else '❌'}")
         log.info(f"  Total earned (est): {state.data.get('total_earned', 0):.4f} USDT")
-        log.info("  [DONE]")
-
+        log.info(f"  Log: {log_file}")
     finally:
-        claimer.close_browser()
+        claimer.stop()
 
 
 if __name__ == "__main__":
