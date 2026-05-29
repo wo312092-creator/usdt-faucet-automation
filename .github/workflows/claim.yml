@@ -5,44 +5,64 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+env:
+  CLAIMER_VERSION: v6-universal
+
 jobs:
   claim-faucets:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
-      - name: Install system dependencies
+
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg libsndfile1
-      
-      - name: Install Python dependencies
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install playwright faster-whisper requests
           python -m playwright install chromium --with-deps
-      
-      - name: Run faucet claimer
+
+      - name: Run claimer
         env:
           FAUCETPAY_EMAIL: ${{ secrets.FAUCETPAY_EMAIL }}
           FAUCETPAY_PASS: ${{ secrets.FAUCETPAY_PASS }}
-          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
-          CAPTCHA_SERVICE: ${{ secrets.CAPTCHA_SERVICE }}
-        run: python claimer.py
-      
+        continue-on-error: true
+        run: python claimer.py 2>&1 | tee claim_log.txt
+
+      - name: Upload screenshots (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: screenshots/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claim-logs
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Commit claim state
         run: |
           git config user.name "faucet-bot"
           git config user.email "bot@faucet.gh"
-          git add claim_state.json 2>/dev/null || true
+          git add claim_state.json logs/ 2>/dev/null || true
           if ! git diff --quiet || ! git diff --staged --quiet 2>/dev/null; then
             git commit -m "auto: claim state $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push
